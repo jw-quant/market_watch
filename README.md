@@ -1,6 +1,6 @@
 # MarketWatch
 
-A modular premarket market monitoring pipeline for ingesting market data, generating sector-level and equity-level signals, and producing structured daily reports.
+A modular premarket market monitoring pipeline for ingesting market data, generating sector-level and equity-level signals, and producing structured daily reports. This pipeline is part of a broader effort to build systematic macro + cross-asset monitoring tools for trading and portfolio decision-making.
 
 ---
 
