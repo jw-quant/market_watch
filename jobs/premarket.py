@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 # Ensure repo root is on sys.path so "import src...." works when running as a script
@@ -102,18 +103,25 @@ class EquityResult:
     recent_abn: List[str]
 
 
-def pipeline_equity(textlist: List[str], jpblist: List[str], market_date) -> EquityResult:
+@dataclass
+class OptionsResult:
+    summary_df: object  # pandas DataFrame
+    iv_spike: List[str]
+
+
+def pipeline_equity(textlist: List[str], jpblist: List[str], market_date, tickers: Optional[List[str]] = None) -> EquityResult:
     """
     Runs:
       - update universe prices
       - generate equity abnormal-vol report
     Appends a compact text artifact to textlist.
+    Pass tickers explicitly after the Reddit step has updated tickers.json.
     """
     from src.prices.polygon_client import save_universe_excel
     from src.prices.smf_process import generate_reports, generate_macro
 
     print("\n=== [Equity] Updating prices ===")
-    updates = save_universe_excel(market_date=market_date)
+    updates = save_universe_excel(tickers=tickers, market_date=market_date)
 
     # Print updates compactly
     if isinstance(updates, dict):
@@ -130,11 +138,11 @@ def pipeline_equity(textlist: List[str], jpblist: List[str], market_date) -> Equ
         print(updates)
 
     print("\n=== [Equity] Generating macro summary ===")
-    macro_df = generate_macro(asof_date=market_date)
+    macro_df = generate_macro(tickers=tickers, asof_date=market_date)
     macro_df['name'] = macro_df['symbol'].map(SECTOR_TICKER_NAME_MAP).fillna('')
 
     print("\n=== [Equity] Generating report ===")
-    summary_df, vol_spike, recent_abn = generate_reports(asof_date=market_date)
+    summary_df, vol_spike, recent_abn = generate_reports(tickers=tickers, asof_date=market_date)
 
     # Build a compact text block for the processor
     ts = _now_tag()
@@ -168,6 +176,138 @@ def pipeline_equity(textlist: List[str], jpblist: List[str], market_date) -> Equ
     _append_text(textlist, p)
 
     return EquityResult(summary_df=summary_df, vol_spike=vol_spike, recent_abn=recent_abn)
+
+
+def pipeline_options(textlist: List[str], jpblist: List[str], market_date, tickers: Optional[List[str]] = None) -> OptionsResult:
+    """
+    Runs:
+      - update universe IV series (30D constant-maturity ATM close)
+      - generate options IV spike report
+    Appends a compact text artifact to textlist.
+    Pass tickers explicitly after the Reddit step has updated tickers.json.
+    """
+    from src.options.options_client import update_atm_iv_series
+    from src.options.options_process import generate_options_report
+
+    print("\n=== [Options] Updating IV series ===")
+    updates = update_atm_iv_series(tickers=tickers)
+
+    # Print updates compactly
+    if isinstance(updates, dict):
+        changed = 0
+        for t, info in updates.items():
+            mode = info.get("mode", "?") if isinstance(info, dict) else "?"
+            rows = info.get("rows", 0) if isinstance(info, dict) else int(info)
+            if mode != "noop" and rows > 0:
+                print(f"{t}: {mode} (+{rows})")
+                changed += 1
+        if changed == 0:
+            print("(no updates)")
+    else:
+        print(updates)
+
+    print("\n=== [Options] Generating report ===")
+    summary_df, iv_spike = generate_options_report(tickers=tickers)
+
+    # Build a compact text block for the processor
+    ts = _now_tag()
+    lines = []
+    lines.append(f"OPTIONS FLAGS — {ts}")
+    lines.append("")
+
+    if summary_df is not None and not summary_df.empty:
+        lines.append("OPTIONS IV SPIKE SUMMARY:")
+        cols = [c for c in ["ticker", "iv_latest", "ewma_iv", "z_iv_21", "iv_ratio_vs_spy", "flag_options_iv_spike"]
+                if c in summary_df.columns]
+        if cols:
+            lines.append(summary_df[cols].to_string(index=False))
+        lines.append("")
+
+    lines.append("OptionsIVSpikeFlags: " + (", ".join(iv_spike) if iv_spike else "(none)"))
+
+    p = _write_text_report(f"options_flags_{ts}.txt", "\n".join(lines))
+    _append_text(textlist, p)
+
+    return OptionsResult(summary_df=summary_df, iv_spike=iv_spike)
+
+
+def pipeline_reddit_wisdom(textlist: List[str]) -> None:
+    """
+    Runs ApeWisdom fetch + dynamic ticker state update.
+    Updates data/reddit/ticker_state.csv and data/config/tickers.json.
+    """
+    from src.reddit.apewisdom import main as apewisdom_main
+    from src.reddit.wisdomprocess import main as wisdomprocess_main
+
+    print("\n=== [ApeWisdom] Fetch daily top100 ===")
+    apewisdom_main()
+
+    print("\n=== [ApeWisdom] Update dynamic ticker state ===")
+    summary = wisdomprocess_main()
+
+    ts = _now_tag()
+    lines = [
+        f"APEWISDOM TICKER STATE — {ts}",
+        "",
+        f"date: {summary.get('date')}",
+        f"eligible_hot_today: {summary.get('eligible_hot_today')}",
+        f"eligible_candidates_today: {summary.get('eligible_candidates_today')}",
+        f"active_hot: {summary.get('active_hot')}",
+        f"active_candidates: {summary.get('active_candidates')}",
+    ]
+
+    p = _write_text_report(f"apewisdom_ticker_state_{ts}.txt", "\n".join(lines))
+    _append_text(textlist, p)
+
+
+def pipeline_news(textlist: List[str]) -> None:
+    """
+    Fetch GDELT headlines (last 1h, 30 articles), cluster, select top 15.
+    Skips fetch if cache is fresh. Falls back to cached files on rate-limit.
+    Appends a compact text artifact to textlist.
+    """
+    from src.news.gdelt import main as gdelt_fetch
+    from src.news.gdelt_process import main as gdelt_process
+    from datetime import date
+    from src.news.gdelt_process import get_output_dir
+
+    out_dir = get_output_dir(date.today())
+
+    print("\n=== [News] Fetching GDELT headlines ===")
+    try:
+        gdelt_fetch()
+    except Exception as exc:
+        articles_csv = out_dir / "gdelt_articles.csv"
+        if articles_csv.exists():
+            print(f"[News] fetch failed ({exc}); using cached articles")
+        else:
+            print(f"[News] fetch failed and no cache available: {exc}")
+            p = _write_text_report(f"news_top15_{_now_tag()}.txt", f"NEWS — (fetch failed, no cache)\n{exc}")
+            _append_text(textlist, p)
+            return
+
+    print("\n=== [News] Processing top 15 clusters ===")
+    try:
+        gdelt_process()
+    except Exception as exc:
+        print(f"[News] processing failed: {exc}")
+
+    top_csv = out_dir / "gdelt_top20.csv"
+    ts = _now_tag()
+    if top_csv.exists():
+        import pandas as pd
+        df = pd.read_csv(top_csv)
+        lines = [f"NEWS TOP 15 — {ts}", ""]
+        for _, row in df.iterrows():
+            lines.append(f"[{row.get('latest_time', '')}] {row.get('cluster_headline', '')}")
+            lines.append(f"  sources={row.get('source_count', '')} articles={row.get('article_count', '')} url={row.get('sample_url', '')}")
+            lines.append("")
+        content = "\n".join(lines)
+    else:
+        content = f"NEWS TOP 15 — {ts}\n\n(no news data available)"
+
+    p = _write_text_report(f"news_top15_{ts}.txt", content)
+    _append_text(textlist, p)
 
 
 def pipeline_reddit_mongo() -> None:
@@ -386,15 +526,52 @@ def main(send_email: bool = True, market_date=None):
     textlist: List[str] = []
     jpblist: List[str] = []
 
-    # 1) Equity pipeline (prices + flags)
-    # Comment this block out if you want to skip equity.
+    # 1) Reddit / ApeWisdom — MUST run first to update the dynamic ticker universe
     try:
-        equity = pipeline_equity(textlist, jpblist, market_date=market_date)
+        pipeline_reddit_wisdom(textlist)
     except Exception:
-        print("\n[ERROR] Equity pipeline failed.")
+        print("\n[ERROR] ApeWisdom ticker-state pipeline failed.")
         traceback.print_exc()
 
-    # # 2) Reddit → Mongo ingestion + sentiment
+    # Reload ticker universe from the freshly updated tickers.json
+    from src.utility.constant import get_smf_tickers
+    fresh_tickers = get_smf_tickers()
+    from src.utility.constant import get_sectors
+    sectors = get_sectors()
+    print(f"[premarket] ticker universe size={len(fresh_tickers)}")
+
+    # # 2) Equity pipeline (prices + flags)
+    # # Comment this block out if you want to skip equity.
+    # try:
+    #     pipeline_equity(textlist, jpblist, market_date=market_date, tickers=fresh_tickers)
+    # except Exception:
+    #     print("\n[ERROR] Equity pipeline failed.")
+    #     traceback.print_exc()
+
+    # # # Pause between equity and options pipelines to avoid rate-limit on free tier
+    # # print("\n=== [Rate-limit pause] Waiting 60s before options pipeline ===")
+    # # for remaining in range(60, 0, -10):
+    # #     print(f"  ...{remaining}s remaining")
+    # #     time.sleep(10)
+    # # print("  ...resuming")
+
+    # # 3) Options pipeline (IV + iv-spike flags)
+    # # Comment this block out if you want to skip options.
+    # try:
+    #     options = pipeline_options(textlist, jpblist, market_date=market_date, tickers=sectors)
+    # except Exception:
+    #     print("\n[ERROR] Options pipeline failed.")
+    #     traceback.print_exc()
+
+    # 4) News pipeline (GDELT fetch + top-20 clusters)
+    # Comment this block out if you want to skip news.
+    try:
+        pipeline_news(textlist)
+    except Exception:
+        print("\n[ERROR] News pipeline failed.")
+        traceback.print_exc()
+
+    # # 5) Reddit → Mongo ingestion + sentiment
     # # Comment this block out if you want to skip reddit ingestion.
     # try:
     #     pipeline_reddit_mongo()
@@ -402,7 +579,7 @@ def main(send_email: bool = True, market_date=None):
     #     print("\n[ERROR] Reddit mongo/sentiment pipeline failed.")
     #     traceback.print_exc()
 
-    # # 3) Reddit heatmap + top mentions snapshot
+    # # 6) Reddit heatmap + top mentions snapshot
     # # Comment this block out if you want to skip reddit plotting.
     # try:
     #     pipeline_reddit_graph_and_summary(textlist, jpblist)
@@ -410,7 +587,7 @@ def main(send_email: bool = True, market_date=None):
     #     print("\n[ERROR] Reddit graph/snapshot pipeline failed.")
     #     traceback.print_exc()
 
-    # # 4) Processor → email payload → send
+    # # 7) Processor → email payload → send
     # # Comment out to stop at artifacts only.
     # try:
     #     process_and_send(textlist, jpblist, send_email=send_email)
@@ -418,7 +595,7 @@ def main(send_email: bool = True, market_date=None):
     #     print("\n[ERROR] Processor/email step failed.")
     #     traceback.print_exc()
 
-    # 5) Temporary send fallback
+    # 8) Temporary send fallback
     # Use this instead of process_and_send if OpenAI is unavailable.
     # Uncomment the lines below to run temporary_send instead of process_and_send.
     try:

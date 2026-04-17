@@ -1,23 +1,17 @@
 # options_client.py
 # Build/append a daily series of *constant-maturity 30D ATM close IV* per ticker.
-# - Uses your equity CSVs in data/<TICKER>.csv for the underlying close (S).
-# - Lists option contracts/expiries *as of each historical date* with tight filters:
-#     expiration_date in [as_of+20d, as_of+50d]   (brackets ~30D)
-#     strike_price  in [S*(1-b), S*(1+b)]        (b = 20% → auto-tighten if paging)
-# - Pulls the option's *daily close* and solves IV via Black–Scholes.
-# - Within expiry: ATM by strike (bracket S; linear interpolate IV in strike).
-# - Across expiries: 30D constant-maturity via *variance* interpolation (linear in T on σ²).
 #
-# Output per ticker: data/<TICKER>_atm_iv.csv with:
-#   date, ticker, iv_cm_30d_close, method, expiry1, dte1, iv1, expiry2, dte2, iv2, w, ...
+# Simplified approach:
+# - Single API call: fetch options contracts filtered by both expiry + strike range
+# - Post-process: find 2 closest-to-30D expiries, extract ATM bracket (below/above spot)
+# - Compute: average IVs within expiry, interpolate across expiries for 30D constant-maturity
 #
-# Notes:
-# - Keeps public function names stable.
-# - Historical greeks/IV are not provided by Polygon REST; we compute from prices.
-# - Paging control: we *prefer tightening filters* over increasing limit.
+# Output per ticker: options/<TICKER>_atm_iv.csv
+#   date, ticker, iv_cm_30d, method, expiry_lower, dte_lower, iv_lower, expiry_upper, dte_upper, iv_upper, weight
 
 from __future__ import annotations
 import math
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional, Iterable, List, Dict, Tuple
@@ -26,66 +20,78 @@ import httpx
 import numpy as np
 import pandas as pd
 
-from src.utility.constant import POLYGON_API_KEY, SMF_TICKERS, DATA_DIR
-from polygon_client import DEFAULT_INIT_START  # "2024-01-01"
+from src.utility.constant import SMF_TICKERS, PRICES_DIR, OPTIONS_DIR
+from src.common.env import getenv_required
+
+OPTIONS_DEFAULT_INIT_START = "2026-04-15"  # fallback start date for initial IV backfill
 
 BASE = "https://api.polygon.io"
+MASSIVE_BASE = "https://api.massive.com"
 
-# Target maturity + guards
-TARGET_CM_DAYS = 30         # constant-maturity target (calendar)
-EXP_LO_BUMP = 20            # as_of + 20d  → lower bound for expiries
-EXP_HI_BUMP = 50            # as_of + 50d  → upper bound for expiries
-MIN_DTE = 2                 # avoid expiry-day noise
-
-# Strike band strategy (around spot): try 20%, then 10%, then 5%
-STRIKE_BANDS = [0.20, 0.10, 0.05]
-
-# Minimal liquidity guard for historical daily bars
+# Constants
+TARGET_CM_DAYS = 30
+EXP_LO_BUMP = 20
+EXP_HI_BUMP = 50
+MIN_DTE = 2
+STRIKE_BAND = 0.05  # ±5% around spot
 MIN_BAR_VOLUME = 10
 
-# ------------------------ HTTP helpers ------------------------
+# ======================== HTTP Helpers ========================
 
 def _client() -> httpx.Client:
     return httpx.Client(timeout=30.0)
 
 def _get(path: str, params: dict) -> dict:
-    if not POLYGON_API_KEY or "PUT_YOUR_KEY_HERE" in POLYGON_API_KEY:
-        raise RuntimeError("Set POLYGON_API_KEY in cfg.py")
     qp = dict(params or {})
-    qp["apiKey"] = POLYGON_API_KEY
+    api_key = getenv_required("POLYGON_API_KEY").strip().strip('"').strip("'")
+    qp["apiKey"] = api_key
+
     with _client() as c:
         r = c.get(f"{BASE}{path}", params=qp)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            print("HTTP ERROR")
+            print("status:", r.status_code)
+            print("url:", str(r.url))
+            print("text:", r.text[:1000])
+            raise
         return r.json()
 
-def _get_absolute(next_url: str) -> dict:
-    # Follow Polygon's next_url directly (already includes query params & key if provided).
-    # We add key defensively in case it's omitted.
-    if "apiKey=" not in next_url:
-        sep = "&" if ("?" in next_url) else "?"
-        next_url = f"{next_url}{sep}apiKey={POLYGON_API_KEY}"
+def _get_massive(path: str, params: dict) -> dict:
+    qp = dict(params or {})
+    api_key = getenv_required("POLYGON_API_KEY").strip().strip('"').strip("'")
+    qp["apiKey"] = api_key
+
     with _client() as c:
-        r = c.get(next_url)
-        r.raise_for_status()
+        r = c.get(f"{MASSIVE_BASE}{path}", params=qp)
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            print("HTTP ERROR")
+            print("status:", r.status_code)
+            print("url:", str(r.url))
+            print("text:", r.text[:1000])
+            raise
         return r.json()
 
-# ------------------------ File paths ------------------------
+# ======================== File Path Helpers ========================
 
 def _spot_path(ticker: str) -> Path:
-    return Path(DATA_DIR) / f"{ticker.upper()}.csv"
+    """Load spot price from prices directory."""
+    return Path(PRICES_DIR) / f"{ticker.upper()}.csv"
 
 def _iv_path(ticker: str) -> Path:
-    return Path(DATA_DIR) / f"{ticker.upper()}_atm_iv.csv"
+    """Save/load IV series from options directory."""
+    return Path(OPTIONS_DIR) / f"{ticker.upper()}_atm_iv.csv"
 
 def _ensure_data_dir():
-    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(OPTIONS_DIR).mkdir(parents=True, exist_ok=True)
 
-# ------------------------ Spot close loader ------------------------
+# ======================== Spot Price Loading ========================
 
 def _load_spot_series(ticker: str) -> pd.DataFrame:
-    """
-    Load per-ticker OHLC CSV and return df with ['date','spot_close'] sorted ascending.
-    """
+    """Load per-ticker OHLC CSV and return df with ['date','spot_close'] sorted ascending."""
     p = _spot_path(ticker)
     if not p.exists():
         raise FileNotFoundError(f"Missing spot CSV for {ticker}: {p}")
@@ -95,9 +101,7 @@ def _load_spot_series(ticker: str) -> pd.DataFrame:
     return df[["date", "close"]].rename(columns={"close": "spot_close"})
 
 def _iv_series_last_date(ticker: str) -> Optional[date]:
-    """
-    Return most recent saved IV date from data/<TICKER>_atm_iv.csv, else None.
-    """
+    """Return most recent saved IV date from options/<TICKER>_atm_iv.csv, else None."""
     p = _iv_path(ticker)
     if not p.exists():
         return None
@@ -109,133 +113,71 @@ def _iv_series_last_date(ticker: str) -> Optional[date]:
         return None
     return d.max().date()
 
-# ------------------------ Contracts & bars (with tight filters) ------------------------
+# ======================== Options Contracts (Single API Call) ========================
 
-def _list_expiries(ticker: str, asof: date) -> List[date]:
+def _fetch_atm_contracts(
+    ticker: str, 
+    asof: date, 
+    spot: float,
+) -> pd.DataFrame:
     """
-    Return expiration dates for the underlying *as of that date*, filtered to [as_of+20d, as_of+50d].
-    This drastically reduces catalog size and naturally brackets ~30D.
+    Single API call to fetch call contracts with:
+      - expiration: [asof+20d, asof+50d]
+      - strike: [spot*0.95, spot*1.05]
+    Returns df with columns: option_symbol, strike, type, expiration
     """
     exp_lo = (asof + timedelta(days=EXP_LO_BUMP)).isoformat()
     exp_hi = (asof + timedelta(days=EXP_HI_BUMP)).isoformat()
+    strike_lo = spot * (1.0 - STRIKE_BAND)
+    strike_hi = spot * (1.0 + STRIKE_BAND)
 
     j = _get("/v3/reference/options/contracts", {
         "underlying_ticker": ticker.upper(),
         "as_of": asof.isoformat(),
         "expiration_date.gte": exp_lo,
         "expiration_date.lte": exp_hi,
-        "limit": 200,  # modest cap; expiries are few even on liquid names
+        "strike_price.gte": strike_lo,
+        "strike_price.lte": strike_hi,
+        "contract_type": "call",
+        "limit": 100,
     })
 
-    exps = set()
+    rows = []
     for item in (j.get("results") or []):
-        exp = item.get("expiration_date")
-        if not exp:
+        try:
+            rows.append({
+                "option_symbol": item["ticker"],
+                "strike": float(item["strike_price"]),
+                "type": item["contract_type"],
+                "expiration": pd.to_datetime(item["expiration_date"]).date(),
+            })
+        except Exception:
             continue
-        ed = pd.to_datetime(exp, errors="coerce")
-        if pd.isna(ed):
-            continue
-        ed = ed.date()
-        if ed >= asof:
-            exps.add(ed)
-    return sorted(exps)
 
-def _contracts_for_expiry(
-    ticker: str,
-    expiry: date,
-    asof: Optional[date] = None,
-    strike_gte: Optional[float] = None,
-    strike_lte: Optional[float] = None,
-    limit: int = 200,
-    tighten_if_paged: bool = True,
-) -> pd.DataFrame:
-    """
-    Contracts metadata for a given expiry (point-in-time), with *strike band* filters.
-    If Polygon still paginates (returns next_url), we optionally *tighten the band* rather than paging.
-    Columns: option_symbol, strike, type ('call'|'put'), expiration (date)
-    """
-    def query(band_low: Optional[float], band_high: Optional[float]) -> Tuple[pd.DataFrame, bool]:
-        params = {
-            "underlying_ticker": ticker.upper(),
-            "expiration_date": expiry.isoformat(),
-            "limit": limit,
-        }
-        if asof:
-            params["as_of"] = asof.isoformat()
-        if band_low is not None:
-            params["strike_price.gte"] = band_low
-        if band_high is not None:
-            params["strike_price.lte"] = band_high
-
-        j = _get("/v3/reference/options/contracts", params)
-        paged = bool(j.get("next_url"))
-        rows = []
-        for it in (j.get("results") or []):
-            try:
-                rows.append({
-                    "option_symbol": it["ticker"],
-                    "strike": float(it["strike_price"]),
-                    "type": it["contract_type"],     # 'call' or 'put'
-                    "expiration": pd.to_datetime(it["expiration_date"]).date(),
-                })
-            except Exception:
-                continue
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df = df[df["expiration"] == expiry]
-        return df, paged
-
-    df, paged = query(strike_gte, strike_lte)
-
-    if tighten_if_paged and paged:
-        # If we still page, try progressively tighter bands around the *midpoint* of [gte, lte] or use spot-based band upstream.
-        # Here we just halve width if bounds were provided; if not, we can't tighten meaningfully.
-        for _ in range(2):  # try 2 more tighten attempts
-            if strike_gte is None or strike_lte is None:
-                break
-            mid = 0.5 * (strike_gte + strike_lte)
-            width = 0.5 * (strike_lte - strike_gte)
-            if width <= 0:
-                break
-            strike_gte, strike_lte = mid - 0.5 * width, mid + 0.5 * width
-            df2, paged2 = query(strike_gte, strike_lte)
-            df, paged = (df2, paged2) if not df2.empty else (df, paged2)
-            if not paged:
-                break
-
-    # As a last resort, if still big, keep only the 40 strikes closest to ATM-ish region (caller decides ATM).
-    if not df.empty and len(df["strike"].unique()) > 40:
-        ks = sorted(df["strike"].unique())
-        # closeness to median strike (proxy; the real ATM proximity is enforced in caller with spot)
-        med = ks[len(ks)//2]
-        ks_sorted = sorted(ks, key=lambda k: abs(k - med))[:40]
-        df = df[df["strike"].isin(ks_sorted)]
-
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df[df["expiration"] >= asof]  # sanity check
     return df
 
 def _option_daily_close(option_symbol: str, asof: date) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Fetch the option's *daily bar* close price and volume for 'asof' date.
-    Returns (close_price, volume). None if not available.
-    """
-    path = f"/v2/aggs/ticker/{option_symbol}/range/1/day/{asof.isoformat()}/{asof.isoformat()}"
+    """Fetch the option's daily bar close price and volume for 'asof' date. Returns (close_price, volume)."""
+    path = f"/v1/open-close/{option_symbol}/{asof.isoformat()}"
     try:
-        j = _get(path, {"adjusted": "true", "sort": "asc", "limit": 500})
-    except httpx.HTTPError:
+        j = _get_massive(path, {"adjusted": "true"})
+    except httpx.HTTPStatusError as e:
+        print(f"[option-close-error] symbol={option_symbol} date={asof} status={e.response.status_code}")
+        print(e.response.text[:1000])
         return (None, None)
-    results = j.get("results") or []
-    if not results:
+    except httpx.HTTPError as e:
+        print(f"[option-close-network-error] symbol={option_symbol} date={asof} err={e}")
         return (None, None)
-    r = results[0]
-    close = float(r.get("c")) if r.get("c") is not None else None
-    vol = float(r.get("v")) if r.get("v") is not None else None
+    if j.get("status") != "OK":
+        return (None, None)
+    close = float(j["close"]) if j.get("close") is not None else None
+    vol = float(j["volume"]) if j.get("volume") is not None else None
     return (close, vol)
 
-# Kept for API surface compatibility; not used in historical flow
-def _snapshot_quote(option_symbol: str) -> Optional[dict]:
-    return None
-
-# ------------------------ Black–Scholes helpers ------------------------
+# ======================== Black-Scholes Helpers ========================
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -250,8 +192,11 @@ def _bs_price(is_call: bool, S: float, K: float, T: float, r: float, q: float, s
     else:
         return K * math.exp(-r * T) * _norm_cdf(-d2) - S * math.exp(-q * T) * _norm_cdf(-d1)
 
-def _implied_vol_bisection(is_call: bool, S: float, K: float, T: float, r: float, q: float, price: float,
-                           tol: float = 1e-6, max_iter: int = 100, low: float = 1e-4, high: float = 5.0) -> Optional[float]:
+def _implied_vol_bisection(
+    is_call: bool, S: float, K: float, T: float, r: float, q: float, price: float,
+    tol: float = 1e-6, max_iter: int = 100, low: float = 1e-4, high: float = 5.0
+) -> Optional[float]:
+    """Solve for IV using bisection."""
     if price is None or price <= 0 or S <= 0 or K <= 0 or T <= 0:
         return None
     intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
@@ -283,248 +228,318 @@ def _implied_vol_bisection(is_call: bool, S: float, K: float, T: float, r: float
     return float(0.5 * (lo + hi))
 
 def _risk_free_rate(asof: date, T_years: float) -> float:
-    # v1: flat proxy; swap to actual curve later if needed
+    """Flat proxy for risk-free rate."""
     return 0.03
 
-# ------------------------ ATM-by-strike within one expiry ------------------------
+# ======================== ATM IV Computation ========================
 
-def _best_iv_at_strike(meta: pd.DataFrame, strike: float, spot: float, asof: date, expiry: date) -> Tuple[Optional[float], Optional[dict]]:
+def _atm_iv_for_expiry(
+    ticker: str, 
+    expiry: date, 
+    spot: float, 
+    asof: date,
+    contracts_df: pd.DataFrame
+) -> Optional[Tuple[float, dict]]:
     """
-    For a given strike, fetch CALL and PUT daily close prices for 'asof',
-    invert BS for each, and return the cleaner IV (or average if both exist).
+    Compute ATM IV for a specific expiry.
+    - Find strikes immediately below & above spot
+    - Fetch daily close for both
+    - Solve for IVs, average them
+    Returns (iv_atm, trace) or None
     """
-    rows = meta.loc[meta["strike"] == strike]
-    chosen = []
-
-    for side in ("call", "put"):
-        sym = rows.loc[rows["type"] == side, "option_symbol"]
-        if sym.empty:
-            continue
-        symbol = sym.iloc[0]
-        px, vol = _option_daily_close(symbol, asof)
-        if px is None or (vol is not None and vol < MIN_BAR_VOLUME):
-            continue
-
-        is_call = (side == "call")
-        T = max((expiry - asof).days, MIN_DTE) / 365.0
-        r = _risk_free_rate(asof, T)
-        q = 0.0
-
-        iv = _implied_vol_bisection(is_call, S=float(spot), K=float(strike), T=T, r=r, q=q, price=float(px))
-        if iv is None or not (0 < iv < 5.0):
-            continue
-
-        chosen.append((iv, {
-            f"{side}_symbol": symbol,
-            "side": side,
-            "price": px,
-            "bar_vol": vol,
-            "T": T,
-            "r": r
-        }))
-
-    if not chosen:
-        return None, None
-    if len(chosen) == 1:
-        return chosen[0][0], chosen[0][1]
-
-    iv_avg = 0.5 * (chosen[0][0] + chosen[1][0])
-    meta_out = {"call_put_avg": True}
-    for _, info in chosen:
-        meta_out.update(info)
-    return iv_avg, meta_out
-
-def _atm_iv_for_expiry(ticker: str, expiry: date, spot: float, asof: date) -> Optional[Tuple[float, dict]]:
-    """
-    Compute ATM IV at a specific expiry (as-of a date) with *strike-band filtered* contracts.
-    Returns (iv_atm, trace) or None.
-    """
-    # choose strike band attempts around spot
-    meta = None
-    for b in STRIKE_BANDS:
-        lo = spot * (1.0 - b)
-        hi = spot * (1.0 + b)
-        meta = _contracts_for_expiry(
-            ticker, expiry, asof=asof,
-            strike_gte=lo, strike_lte=hi,
-            limit=200, tighten_if_paged=True
-        )
-        if not meta.empty:
-            break
-    if meta is None or meta.empty:
+    # Filter contracts for this expiry
+    meta = contracts_df[contracts_df["expiration"] == expiry]
+    if meta.empty:
         return None
 
     strikes = sorted(meta["strike"].unique())
-    # bracket spot
     lo_strike = max([k for k in strikes if k <= spot], default=None)
     hi_strike = min([k for k in strikes if k >= spot], default=None)
 
     if lo_strike is None and hi_strike is None:
         return None
-    if lo_strike is None:
-        iv_hi, info_hi = _best_iv_at_strike(meta, hi_strike, spot, asof, expiry)
-        if iv_hi is None:
-            return None
-        return iv_hi, {"method": "single_hi", "strike_hi": hi_strike, "iv_hi": iv_hi, **(info_hi or {})}
-    if hi_strike is None:
-        iv_lo, info_lo = _best_iv_at_strike(meta, lo_strike, spot, asof, expiry)
-        if iv_lo is None:
-            return None
-        return iv_lo, {"method": "single_lo", "strike_lo": lo_strike, "iv_lo": iv_lo, **(info_lo or {})}
 
-    iv_lo, info_lo = _best_iv_at_strike(meta, lo_strike, spot, asof, expiry)
-    iv_hi, info_hi = _best_iv_at_strike(meta, hi_strike, spot, asof, expiry)
+    # Collect IVs from available strikes
+    ivs = []
+    info_dict = {}
 
-    if iv_lo is None and iv_hi is None:
+    for strike, name in [(lo_strike, "lo"), (hi_strike, "hi")]:
+        if strike is None:
+            continue
+        row = meta[meta["strike"] == strike]
+        if row.empty:
+            continue
+        sym = row["option_symbol"].iloc[0]
+        px, vol = _option_daily_close(sym, asof)
+        if px is None or (vol is not None and vol < MIN_BAR_VOLUME):
+            continue
+
+        T = max((expiry - asof).days, MIN_DTE) / 365.0
+        r = _risk_free_rate(asof, T)
+        q = 0.0
+
+        iv = _implied_vol_bisection(is_call=True, S=float(spot), K=float(strike), T=T, r=r, q=q, price=float(px))
+        if iv is None or not (0 < iv < 5.0):
+            continue
+
+        ivs.append(iv)
+        info_dict[f"{name}_strike"] = strike
+        info_dict[f"{name}_iv"] = iv
+
+    if not ivs:
         return None
-    if iv_lo is None:
-        return iv_hi, {"method": "single_hi", "strike_hi": hi_strike, "iv_hi": iv_hi, **(info_hi or {})}
-    if iv_hi is None:
-        return iv_lo, {"method": "single_lo", "strike_lo": lo_strike, "iv_lo": iv_lo, **(info_lo or {})}
 
-    w = (float(spot) - lo_strike) / (hi_strike - lo_strike) if hi_strike > lo_strike else 0.5
-    iv_atm = (1 - w) * iv_lo + w * iv_hi
+    # Average the IVs (if both exist, else just the one)
+    iv_avg = float(np.mean(ivs))
     trace = {
-        "method": "interp",
-        "strike_lo": lo_strike, "iv_lo": iv_lo,
-        "strike_hi": hi_strike, "iv_hi": iv_hi,
-        "w": float(w),
+        "method": "bracket_avg" if len(ivs) == 2 else "single",
+        **info_dict
     }
-    trace.update({f"lo_{k}": v for k, v in (info_lo or {}).items()})
-    trace.update({f"hi_{k}": v for k, v in (info_hi or {}).items()})
-    return iv_atm, trace
+    return iv_avg, trace
 
-# ------------------------ Constant-maturity (variance interpolation) ------------------------
-
-def _constant_maturity_atm_iv(ticker: str, asof: date, spot: float) -> Optional[Tuple[float, dict]]:
+def _constant_maturity_atm_iv(
+    ticker: str,
+    asof: date,
+    spot: float,
+    contracts_df: pd.DataFrame
+) -> Optional[Tuple[float, dict]]:
     """
-    Compute 30D constant-maturity ATM IV via variance interpolation between two expiries.
-    Returns (iv_cm_30d, trace) or None.
+    Compute 30D ATM IV. Find the two expiries closest to 30D (one ≤30d, one ≥30d).
+    Try to compute ATM IV for both; if only one side works, return it as-is.
+    If both work, average the two IVs.
     """
-    expiries = _list_expiries(ticker, asof)
+    expiries = sorted([d for d in contracts_df["expiration"].unique() if (d - asof).days >= MIN_DTE])
     if not expiries:
         return None
 
-    def dte(d): return (d - asof).days
-    valid = [d for d in expiries if dte(d) >= MIN_DTE]
-    if not valid:
-        return None
+    def dte(d):
+        return (d - asof).days
 
-    # pick lower/upper around target
+    # Find lower (≤30d) and upper (≥30d) expiries closest to target
     lower = None
     upper = None
-    for d in valid:
+    for d in expiries:
         if dte(d) <= TARGET_CM_DAYS:
             lower = d
         if dte(d) >= TARGET_CM_DAYS and upper is None:
             upper = d
+
+    # Fallback: if all expiries are on one side, just pick closest
+    if lower is None and upper is not None:
+        lower = upper
+    if upper is None and lower is not None:
+        upper = lower
+
     if lower is None:
-        lower = min(valid, key=lambda x: abs(dte(x) - TARGET_CM_DAYS))
-    if upper is None:
-        upper = min(valid, key=lambda x: abs(dte(x) - TARGET_CM_DAYS))
-
-    if lower == upper:
-        iv_e, tr_e = _atm_iv_for_expiry(ticker, lower, spot, asof)
-        if iv_e is None:
-            return None
-        return iv_e, {"method": "single_expiry", "expiry1": lower.isoformat(), "dte1": dte(lower), "iv1": iv_e}
-
-    iv_l, tr_l = _atm_iv_for_expiry(ticker, lower, spot, asof)
-    iv_u, tr_u = _atm_iv_for_expiry(ticker, upper, spot, asof)
-
-    if iv_l is None and iv_u is None:
         return None
-    if iv_l is None:
-        return iv_u, {
-            "method": "single_expiry_upper",
-            "expiry2": upper.isoformat(), "dte2": dte(upper), "iv2": iv_u,
-            **({f"e2_{k}": v for k, v in (tr_u or {}).items()})
-        }
-    if iv_u is None:
-        return iv_l, {
-            "method": "single_expiry_lower",
-            "expiry1": lower.isoformat(), "dte1": dte(lower), "iv1": iv_l,
-            **({f"e1_{k}": v for k, v in (tr_l or {}).items()})
-        }
 
-    T1 = max(dte(lower), MIN_DTE) / 365.0
-    T2 = max(dte(upper), MIN_DTE) / 365.0
-    T_star = TARGET_CM_DAYS / 365.0
-    w = (T_star - T1) / (T2 - T1) if T2 > T1 else 0.5
-    v1 = iv_l ** 2
-    v2 = iv_u ** 2
-    v_star = (1 - w) * v1 + w * v2
-    iv_star = float(np.sqrt(v_star))
+    # Compute ATM IV for both expiries
+    result_l = _atm_iv_for_expiry(ticker, lower, spot, asof, contracts_df) if lower else None
+    result_u = _atm_iv_for_expiry(ticker, upper, spot, asof, contracts_df) if upper != lower else None
+
+    # Both failed
+    if result_l is None and result_u is None:
+        return None
+
+    # Only one side available — return it directly, no interpolation
+    if result_l is None:
+        iv_u, tr_u = result_u
+        return iv_u, {"method": "single_expiry", "expiry": upper.isoformat(), "dte": dte(upper), "iv": iv_u, **tr_u}
+
+    if result_u is None:
+        iv_l, tr_l = result_l
+        return iv_l, {"method": "single_expiry", "expiry": lower.isoformat(), "dte": dte(lower), "iv": iv_l, **tr_l}
+
+    # Both available — average them
+    iv_l, tr_l = result_l
+    iv_u, tr_u = result_u
+    iv_avg = float(np.mean([iv_l, iv_u]))
 
     trace = {
-        "method": "var_interp",
-        "expiry1": lower.isoformat(), "dte1": dte(lower), "iv1": iv_l,
-        "expiry2": upper.isoformat(), "dte2": dte(upper), "iv2": iv_u,
-        "w": float(w)
+        "method": "two_expiry_avg",
+        "expiry_lower": lower.isoformat(),
+        "dte_lower": dte(lower),
+        "iv_lower": iv_l,
+        "expiry_upper": upper.isoformat(),
+        "dte_upper": dte(upper),
+        "iv_upper": iv_u,
+        **{f"lo_{k}": v for k, v in tr_l.items()},
+        **{f"up_{k}": v for k, v in tr_u.items()},
     }
-    trace.update({f"e1_{k}": v for k, v in (tr_l or {}).items()})
-    trace.update({f"e2_{k}": v for k, v in (tr_u or {}).items()})
-    return iv_star, trace
+    return iv_avg, trace
 
-# ------------------------ Public entrypoint ------------------------
+# ======================== CSV IO ========================
 
-def update_atm_iv_series(tickers: Optional[Iterable[str]] = None) -> Dict[str, int]:
+def _write_iv_csv(ticker: str, df: pd.DataFrame):
+    """Write IV DataFrame to CSV (init path)."""
+    _ensure_data_dir()
+    p = _iv_path(ticker)
+    if not df.empty:
+        df = df.sort_values("date")
+    df.to_csv(p, index=False)
+
+
+def _merge_iv_update(ticker: str, df_new: pd.DataFrame):
+    """Merge new IV rows into existing CSV: concat, dedup on date, sort, save."""
+    _ensure_data_dir()
+    p = _iv_path(ticker)
+    if not p.exists():
+        _write_iv_csv(ticker, df_new)
+        return
+    existing = pd.read_csv(p)
+    merged = pd.concat([existing, df_new], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    merged.to_csv(p, index=False)
+
+
+# ======================== Core Range Fetcher ========================
+
+def fetch_range_atm_iv(ticker: str, start: str, end: str) -> pd.DataFrame:
     """
-    For each ticker:
-      - Determine start date: last saved iv date + 1, else DEFAULT_INIT_START.
-      - Iterate spot close dates >= start date (from data/<TICKER>.csv).
-      - For each date, compute 30D CM ATM close IV and append to data/<TICKER>_atm_iv.csv.
-    Returns {ticker: rows_appended}.
+    Fetch ATM 30D CM IV for each market date in [start, end] (ISO strings).
+    Reads spot prices from the prices CSV; skips dates with no spot data.
+    Returns a DataFrame of computed IV rows (no file I/O).
+    """
+    t = ticker.upper()
+    try:
+        spot_df = _load_spot_series(t)
+    except FileNotFoundError as e:
+        print(f"[spot-missing] {t}: {e}")
+        return pd.DataFrame()
+
+    # Vectorized filter: one pass, eliminates O(n²) per-date lookup
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    filtered = spot_df[
+        (spot_df["date"] >= start_ts) & (spot_df["date"] <= end_ts)
+    ].reset_index(drop=True)
+
+    if filtered.empty:
+        return pd.DataFrame()
+
+    out_rows = []
+    for row in filtered.itertuples(index=False):
+        d = row.date.date()
+        S = float(row.spot_close)
+
+        try:
+            contracts = _fetch_atm_contracts(t, asof=d, spot=S)
+        except Exception as e:
+            print(f"[contracts-error] {t} on {d}: {e}")
+            continue
+
+        if contracts.empty:
+            continue
+
+        cm = _constant_maturity_atm_iv(t, asof=d, spot=S, contracts_df=contracts)
+        if cm is None:
+            continue
+
+        iv_val, trace = cm
+        out_rows.append({
+            "date": d.isoformat(),
+            "ticker": t,
+            "iv_cm_30d": iv_val,
+            **trace,
+        })
+
+    return pd.DataFrame(out_rows)
+
+
+# ======================== Public Entrypoints ========================
+
+def fetch_initial_atm_iv(
+    ticker: str,
+    start: Optional[str] = None,
+    market_date: Optional[date] = None,
+) -> pd.DataFrame:
+    """
+    Full backfill for ticker from OPTIONS_DEFAULT_INIT_START (or custom start)
+    through market_date. Writes CSV and returns the saved DataFrame.
+    """
+    _ensure_data_dir()
+    start = start or OPTIONS_DEFAULT_INIT_START
+    end = (market_date or date.today()).isoformat()
+    df = fetch_range_atm_iv(ticker, start, end)
+    _write_iv_csv(ticker, df)
+    t = ticker.upper()
+    if df.empty:
+        print(f"[warn] {t}: init returned 0 rows ({start}..{end})")
+    else:
+        print(f"[init-ok] {t}: wrote {len(df)} rows [{start}..{end}]")
+    return df
+
+
+def fetch_recent_atm_iv(
+    tickers: Optional[Iterable[str]] = None,
+    market_date: Optional[date] = None,
+) -> Dict[str, dict]:
+    """
+    Incremental updater (mirrors fetch_recent_ohlc):
+    - CSV missing or empty  -> full backfill from OPTIONS_DEFAULT_INIT_START
+    - CSV exists            -> fetch only [last_saved+1 .. market_date]
+    Returns {TICKER: {"mode": "init"|"update"|"noop"|"err", "rows": int, "range": str}}
     """
     tickers = list(tickers) if tickers is not None else list(SMF_TICKERS)
     _ensure_data_dir()
-    appended: Dict[str, int] = {}
+    results: Dict[str, dict] = {}
 
-    for t in map(str.upper, tickers):
+    end_dt = market_date or date.today()
+    end_date = end_dt.isoformat()
+
+    for i, ticker in enumerate(map(str.upper, tickers)):
+        # Pause every 3 tickers to avoid rate-limit on free tier
+        if i > 0:
+            print(f"\n=== [Rate-limit pause] {i}/{len(tickers)} tickers done — waiting 60s ===")
+            for remaining in range(60, 0, -10):
+                print(f"  ...{remaining}s remaining")
+                time.sleep(10)
+            print("  ...resuming")
+
         try:
-            spot_df = _load_spot_series(t)
-        except FileNotFoundError as e:
-            print(f"[spot-missing] {t}: {e}")
-            appended[t] = 0
-            continue
+            p = _iv_path(ticker)
 
-        last_iv_date = _iv_series_last_date(t)
-        start_date = pd.to_datetime(last_iv_date or DEFAULT_INIT_START).date()
-
-        dates = [d.date() for d in spot_df["date"] if d.date() > start_date]
-        if not dates:
-            appended[t] = 0
-            continue
-
-        out_rows = []
-        for d in dates:
-            row = spot_df.loc[spot_df["date"].dt.date == d]
-            if row.empty:
+            # init if missing
+            if not p.exists():
+                df_init = fetch_initial_atm_iv(ticker, start=OPTIONS_DEFAULT_INIT_START, market_date=end_dt)
+                results[ticker] = {"mode": "init", "rows": len(df_init), "range": f"{OPTIONS_DEFAULT_INIT_START}..{end_date}"}
                 continue
-            S = float(row["spot_close"].iloc[0])
 
-            cm = _constant_maturity_atm_iv(t, asof=d, spot=S)
-            if cm is None:
+            latest = _iv_series_last_date(ticker)
+            if latest is None:
+                # file exists but is empty / unparseable -> re-init
+                df_init = fetch_initial_atm_iv(ticker, start=OPTIONS_DEFAULT_INIT_START, market_date=end_dt)
+                results[ticker] = {"mode": "init", "rows": len(df_init), "range": f"{OPTIONS_DEFAULT_INIT_START}..{end_date}"}
                 continue
-            iv_val, trace = cm
-            out_rows.append({
-                "date": d.isoformat(),
-                "ticker": t,
-                "iv_cm_30d_close": iv_val,
-                **trace
-            })
 
-        if out_rows:
-            p = _iv_path(t)
-            df_out = pd.DataFrame(out_rows).sort_values("date")
-            if p.exists():
-                old = pd.read_csv(p)
-                df_out = pd.concat([old, df_out], ignore_index=True)
-                df_out = df_out.drop_duplicates(subset=["date"]).sort_values("date")
-            df_out.to_csv(p, index=False)
-            appended[t] = len(out_rows)
-            print(f"[iv-ok] {t}: appended {len(out_rows)} rows to {p.name}")
-        else:
-            appended[t] = 0
+            start_date = (latest + timedelta(days=1)).isoformat()
 
-    return appended
+            if start_date > end_date:
+                print(f"[noop] {ticker}: up to date (latest={latest})")
+                results[ticker] = {"mode": "noop", "rows": 0, "range": ""}
+                continue
+
+            df_new = fetch_range_atm_iv(ticker, start_date, end_date)
+            if not df_new.empty:
+                _merge_iv_update(ticker, df_new)
+            n = len(df_new)
+            print(f"[iv-ok] {ticker}: appended {n} rows [{start_date}..{end_date}]")
+            results[ticker] = {"mode": "update", "rows": n, "range": f"{start_date}..{end_date}"}
+
+        except httpx.HTTPStatusError as e:
+            print(f"[HTTP {e.response.status_code}] {ticker}: {e}")
+            results[ticker] = {"mode": "err", "rows": 0, "range": "", "error": f"HTTP {e.response.status_code}"}
+        except Exception as e:
+            print(f"[err] {ticker}: {e}")
+            results[ticker] = {"mode": "err", "rows": 0, "range": "", "error": str(e)}
+
+    return results
+
+
+# Backward-compatible alias
+def update_atm_iv_series(
+    tickers: Optional[Iterable[str]] = None,
+    market_date: Optional[date] = None,
+) -> Dict[str, dict]:
+    """Alias for fetch_recent_atm_iv (backward compatibility)."""
+    return fetch_recent_atm_iv(tickers, market_date=market_date)

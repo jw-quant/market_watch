@@ -39,11 +39,29 @@ TICKERS_CONFIG = _load_tickers_config()
 
 BENCHMARK = TICKERS_CONFIG.get("benchmark", ["SPY"])
 SECTOR_TICKERS = TICKERS_CONFIG.get("sector", [])
-SMF_TICKERS_PRE = TICKERS_CONFIG.get("static", [])
-APPROVED_DYNAMIC = TICKERS_CONFIG.get("approved_dynamic", [])
+CORE_TICKERS = TICKERS_CONFIG.get("core", TICKERS_CONFIG.get("static", []))
+HOT_TICKERS = TICKERS_CONFIG.get("hot", [])
+CANDIDATE_TICKERS = TICKERS_CONFIG.get("candidates", [])
 
-# Final universe
-SMF_TICKERS = list(dict.fromkeys(BENCHMARK + SECTOR_TICKERS + SMF_TICKERS_PRE + APPROVED_DYNAMIC))
+# Final universe (loaded at import time; use get_smf_tickers() for a fresh read after tickers.json updates)
+SMF_TICKERS = list(dict.fromkeys(BENCHMARK + SECTOR_TICKERS + CORE_TICKERS + HOT_TICKERS + CANDIDATE_TICKERS))
+
+
+def get_smf_tickers() -> list:
+    """Re-read tickers.json from disk and return the current full universe."""
+    config = _load_tickers_config()
+    benchmark = config.get("benchmark", ["SPY"])
+    sector = config.get("sector", [])
+    core = config.get("core", config.get("static", []))
+    hot = config.get("hot", [])
+    candidates = config.get("candidates", [])
+    return list(dict.fromkeys(benchmark + sector + core ))
+
+def get_sectors() -> list:
+    """Re-read tickers.json from disk and return the current full universe."""
+    config = _load_tickers_config()
+    sector = config.get("sector", [])
+    return list(dict.fromkeys(sector))
 
 
 # How far back to pull (in calendar days). Using 370 to comfortably cover ~252 trading days.
