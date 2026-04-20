@@ -8,7 +8,7 @@ SECTOR_TICKER_NAME_MAP = {
     "HYG": "High Yield Credit",
     "UUP": "US Dollar",
     "IBIT": "Bitcoin",
-    "SOXX": "Chips",
+    "SMH": "Chips",
     "XLF": "Financials",
     "XLE": "Energy",
     "VXX": "VIX"
@@ -55,7 +55,7 @@ def get_smf_tickers() -> list:
     core = config.get("core", config.get("static", []))
     hot = config.get("hot", [])
     candidates = config.get("candidates", [])
-    return list(dict.fromkeys(benchmark + sector + core ))
+    return list(dict.fromkeys(benchmark + sector + core +hot ))
 
 def get_sectors() -> list:
     """Re-read tickers.json from disk and return the current full universe."""
@@ -69,12 +69,13 @@ LOOKBACK_DAYS = 370
 
 # Where Excel files go
 # ---- Data directories (single source of truth) ----
-PRICES_DIR  = f"{DATA_DIR}/prices"
-OPTIONS_DIR = f"{DATA_DIR}/options"
-NEWS_DIR    = f"{DATA_DIR}/news"
-REDDIT_DIR  = f"{DATA_DIR}/reddit"
-REPORTS_DIR = f"{DATA_DIR}/reports"
-GRAPHS_DIR  = f"{REPORTS_DIR}/graphs"
+PRICES_DIR          = f"{DATA_DIR}/prices"
+OPTIONS_DIR         = f"{DATA_DIR}/options"
+NEWS_DIR            = f"{DATA_DIR}/news"
+REDDIT_DIR          = f"{DATA_DIR}/reddit"
+REPORTS_DIR         = f"{DATA_DIR}/reports"
+GRAPHS_DIR          = f"{REPORTS_DIR}/graphs"
+MORNING_REPORT_DIR  = f"{DATA_DIR}/morning_report"
 
 # Free-tier is ~5 req/min. One request per ticker => ~12s spacing.
 RATE_LIMIT_SECS = 12

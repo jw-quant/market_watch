@@ -32,6 +32,8 @@ def _load_iv_series(ticker: str) -> pd.DataFrame:
     df = pd.read_csv(p)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
+    if df.empty:
+        raise ValueError(f"IV CSV is empty for {ticker}: {p}")
     return df[["date", "iv_cm_30d"]].rename(columns={"iv_cm_30d": "iv"})
 
 def _ewma(x: pd.Series, lam=LAM) -> Optional[float]:
@@ -68,9 +70,8 @@ def generate_options_report(tickers: Iterable[str] | None = None):
     for t in map(str.upper, tickers):
         try:
             iv_map[t] = _load_iv_series(t)
-        except FileNotFoundError as e:
-            # Log missing files for visibility
-            print(f"[iv-missing] {t}: {e}")
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[iv-skip] {t}: {e}")
             continue
 
     if bench.upper() not in iv_map:
@@ -91,8 +92,8 @@ def generate_options_report(tickers: Iterable[str] | None = None):
         ratio_vs_spy = (latest_iv / spy_latest) if (spy_latest and not np.isnan(spy_latest) and spy_latest > 0) else np.nan
 
         flag_iv_spike = bool(
-            (not np.isnan(z_iv_21) and z_iv_21 >= 2.5) and
-            (not np.isnan(ratio_vs_spy) and ratio_vs_spy >= 1.2)
+            z_iv_21 is not None and z_iv_21 >= 2.5 and
+            ratio_vs_spy is not None and not np.isnan(ratio_vs_spy) and ratio_vs_spy >= 1.2
         )
 
         rows.append(dict(

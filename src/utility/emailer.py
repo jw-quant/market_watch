@@ -1,10 +1,17 @@
+try:
+    from . import constant as cfg
+except ImportError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    import src.utility.constant as cfg
+
 import smtplib
 from email.message import EmailMessage
 from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
-from . import constant as cfg
 
 
 def _make_plaintext(summary: pd.DataFrame, vol_spike: List[str], recent_abn: List[str]) -> str:
@@ -101,3 +108,20 @@ def send_payload(subject: str, body: str, attachments: List[str] | None = None) 
     except Exception as e:
         print(f"[email-err] {e}")
         raise
+
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from src.common.env import load_env
+    load_env()
+
+    print(f"SMTP host  : {cfg.SMTP_HOST}:{cfg.SMTP_PORT}")
+    print(f"from       : {cfg.EMAIL_FROM or cfg.SMTP_USER}")
+    print(f"to         : {cfg.EMAIL_TO}")
+
+    send_payload(
+        subject="market_watch — email test",
+        body="If you're reading this, SMTP is configured correctly.",
+        attachments=[],
+    )

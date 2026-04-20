@@ -49,9 +49,9 @@ def _load_one(symbol: str) -> TickerData:
 
     # Build daily log-returns
     # Use dividend-adjusted close if available, otherwise use raw close
-    px_col = "adj_close_total_return" if "adj_close_total_return" in df.columns else "close"
+    px_col = "adj_close" if "adj_close" in df.columns else "close"
     c = df[px_col].astype(float)
-    px_col = "adj_open_total_return" if "adj_open_total_return" in df.columns else "open"
+    px_col = "adj_open" if "adj_open" in df.columns else "open"
     o = df[px_col].astype(float)
 
     # close-to-close (align to current day)

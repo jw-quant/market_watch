@@ -138,7 +138,7 @@ def pipeline_equity(textlist: List[str], jpblist: List[str], market_date, ticker
         print(updates)
 
     print("\n=== [Equity] Generating macro summary ===")
-    macro_df = generate_macro(tickers=tickers, asof_date=market_date)
+    macro_df = generate_macro(tickers=None, asof_date=market_date)
     macro_df['name'] = macro_df['symbol'].map(SECTOR_TICKER_NAME_MAP).fillna('')
 
     print("\n=== [Equity] Generating report ===")
@@ -513,16 +513,13 @@ def temporary_send(textlist: List[str], jpblist: List[str], send_email: bool = T
 # Main
 # ---------------------------
 
-def main(send_email: bool = True, market_date=None):
+def main(market_date=None):
     load_env()
     from src.utility.date import last_market_date
 
     market_date = market_date or last_market_date()
     print(f"[premarket] market_date={market_date}")
 
-    # Artifact bundles:
-    # - textlist: paths to txt/md/json outputs
-    # - jpblist: paths to jpg/png heatmaps or other images
     textlist: List[str] = []
     jpblist: List[str] = []
 
@@ -540,13 +537,13 @@ def main(send_email: bool = True, market_date=None):
     sectors = get_sectors()
     print(f"[premarket] ticker universe size={len(fresh_tickers)}")
 
-    # # 2) Equity pipeline (prices + flags)
-    # # Comment this block out if you want to skip equity.
-    # try:
-    #     pipeline_equity(textlist, jpblist, market_date=market_date, tickers=fresh_tickers)
-    # except Exception:
-    #     print("\n[ERROR] Equity pipeline failed.")
-    #     traceback.print_exc()
+    # 2) Equity pipeline (prices + flags)
+    # Comment this block out if you want to skip equity.
+    try:
+        pipeline_equity(textlist, jpblist, market_date=market_date, tickers=fresh_tickers)
+    except Exception:
+        print("\n[ERROR] Equity pipeline failed.")
+        traceback.print_exc()
 
     # # # Pause between equity and options pipelines to avoid rate-limit on free tier
     # # print("\n=== [Rate-limit pause] Waiting 60s before options pipeline ===")
@@ -555,21 +552,21 @@ def main(send_email: bool = True, market_date=None):
     # #     time.sleep(10)
     # # print("  ...resuming")
 
-    # # 3) Options pipeline (IV + iv-spike flags)
-    # # Comment this block out if you want to skip options.
-    # try:
-    #     options = pipeline_options(textlist, jpblist, market_date=market_date, tickers=sectors)
-    # except Exception:
-    #     print("\n[ERROR] Options pipeline failed.")
-    #     traceback.print_exc()
+    # 3) Options pipeline (IV + iv-spike flags)
+    # Comment this block out if you want to skip options.
+    try:
+        options = pipeline_options(textlist, jpblist, market_date=market_date, tickers=sectors)
+    except Exception:
+        print("\n[ERROR] Options pipeline failed.")
+        traceback.print_exc()
 
     # 4) News pipeline (GDELT fetch + top-20 clusters)
     # Comment this block out if you want to skip news.
-    try:
-        pipeline_news(textlist)
-    except Exception:
-        print("\n[ERROR] News pipeline failed.")
-        traceback.print_exc()
+    # try:
+    #     pipeline_news(textlist)
+    # except Exception:
+    #     print("\n[ERROR] News pipeline failed.")
+    #     traceback.print_exc()
 
     # # 5) Reddit → Mongo ingestion + sentiment
     # # Comment this block out if you want to skip reddit ingestion.
@@ -595,16 +592,14 @@ def main(send_email: bool = True, market_date=None):
     #     print("\n[ERROR] Processor/email step failed.")
     #     traceback.print_exc()
 
-    # 8) Temporary send fallback
-    # Use this instead of process_and_send if OpenAI is unavailable.
-    # Uncomment the lines below to run temporary_send instead of process_and_send.
-    try:
-        temporary_send(textlist, jpblist, send_email=send_email)
-    except Exception:
-        print("\n[ERROR] Temporary send step failed.")
-        traceback.print_exc()
+    # Print a summary of what was written for Cowork / logging
+    from src.utility.paths import get_txt_dir
+    txt_dir = get_txt_dir()
+    written = sorted(txt_dir.glob("*.txt"))
+    print(f"\n[premarket] done — {len(written)} artifacts in {txt_dir}")
+    for p in written:
+        print(f"  {p.name}")
 
 
 if __name__ == "__main__":
-    # For now, hard default to sending. You can add argparse later.
-    main(send_email=False)
+    main()

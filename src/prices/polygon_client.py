@@ -147,8 +147,8 @@ def apply_total_return_adjustment(price_df: pd.DataFrame, dividend_df: Optional[
     Enrich price_df with dividend and total-return-adjusted OHLC columns.
     All numeric values rounded to 4 decimals (0.0001 precision).
     Assumes price_df has: ticker, date, open, high, low, close.
-    Returns full DataFrame with added: dividend, adj_factor_total_return, adj_open_total_return, 
-                adj_high_total_return, adj_low_total_return, adj_close_total_return
+    Returns full DataFrame with added: dividend, adj_factor_total_return, adj_open,
+                adj_high, adj_low, adj_close
     """
     df = price_df.copy()
 
@@ -156,10 +156,10 @@ def apply_total_return_adjustment(price_df: pd.DataFrame, dividend_df: Optional[
         for col in [
             "dividend",
             "adj_factor_total_return",
-            "adj_open_total_return",
-            "adj_high_total_return",
-            "adj_low_total_return",
-            "adj_close_total_return",
+            "adj_open",
+            "adj_high",
+            "adj_low",
+            "adj_close",
         ]:
             if col not in df.columns:
                 df[col] = pd.Series(dtype=float)
@@ -222,17 +222,17 @@ def apply_total_return_adjustment(price_df: pd.DataFrame, dividend_df: Optional[
         else:
             adj_factor_vals.append(float("nan"))
 
-    df["adj_close_total_return"] = adj_close_vals
-    df["adj_close_total_return"] = df["adj_close_total_return"].round(4)
+    df["adj_close"] = adj_close_vals
+    df["adj_close"] = df["adj_close"].round(4)
 
     df["adj_factor_total_return"] = adj_factor_vals
     df["adj_factor_total_return"] = df["adj_factor_total_return"].round(4)
 
     # Apply factor to all OHLC
-    df["adj_open_total_return"] = (df["open"] * df["adj_factor_total_return"]).round(4)
-    df["adj_high_total_return"] = (df["high"] * df["adj_factor_total_return"]).round(4)
-    df["adj_low_total_return"] = (df["low"] * df["adj_factor_total_return"]).round(4)
-    df["adj_close_total_return"] = (df["close"] * df["adj_factor_total_return"]).round(4)
+    df["adj_open"] = (df["open"] * df["adj_factor_total_return"]).round(4)
+    df["adj_high"] = (df["high"] * df["adj_factor_total_return"]).round(4)
+    df["adj_low"] = (df["low"] * df["adj_factor_total_return"]).round(4)
+    df["adj_close"] = (df["close"] * df["adj_factor_total_return"]).round(4)
 
     return df
 

@@ -487,17 +487,30 @@ def fetch_recent_atm_iv(
     end_dt = market_date or date.today()
     end_date = end_dt.isoformat()
 
-    for i, ticker in enumerate(map(str.upper, tickers)):
-        # Pause every 3 tickers to avoid rate-limit on free tier
-        if i > 0:
-            print(f"\n=== [Rate-limit pause] {i}/{len(tickers)} tickers done — waiting 60s ===")
-            for remaining in range(60, 0, -10):
-                print(f"  ...{remaining}s remaining")
-                time.sleep(10)
-            print("  ...resuming")
+    fetch_count = 0  # tracks tickers that actually need API calls (not noops)
 
+    for ticker in map(str.upper, tickers):
         try:
             p = _iv_path(ticker)
+
+            # --- Noop check first: no pause, no API call ---
+            if p.exists():
+                latest = _iv_series_last_date(ticker)
+                if latest is not None:
+                    start_date = (latest + timedelta(days=1)).isoformat()
+                    if start_date > end_date:
+                        print(f"[noop] {ticker}: up to date (latest={latest})")
+                        results[ticker] = {"mode": "noop", "rows": 0, "range": ""}
+                        continue
+
+            # --- Only pause before tickers that are actually fetching ---
+            if fetch_count > 0:
+                print(f"\n=== [Rate-limit pause] waiting 60s before next fetch ===")
+                for remaining in range(60, 0, -10):
+                    print(f"  ...{remaining}s remaining")
+                    time.sleep(10)
+                print("  ...resuming")
+            fetch_count += 1
 
             # init if missing
             if not p.exists():
@@ -513,12 +526,7 @@ def fetch_recent_atm_iv(
                 continue
 
             start_date = (latest + timedelta(days=1)).isoformat()
-
-            if start_date > end_date:
-                print(f"[noop] {ticker}: up to date (latest={latest})")
-                results[ticker] = {"mode": "noop", "rows": 0, "range": ""}
-                continue
-
+            # start_date <= end_date guaranteed here (noop already screened out above)
             df_new = fetch_range_atm_iv(ticker, start_date, end_date)
             if not df_new.empty:
                 _merge_iv_update(ticker, df_new)

@@ -124,7 +124,7 @@ def save_outputs(payload: dict, df: pd.DataFrame, out_dir: Path) -> None:
 def main() -> None:
     load_env()
 
-    filter_name = _env_str("APEWISDOM_FILTER", "all")
+    filter_name = _env_str("APEWISDOM_FILTER", "all-stocks")
     as_of = date.today()
     out_dir = get_output_dir(as_of)
 
