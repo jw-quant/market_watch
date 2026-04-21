@@ -34,6 +34,7 @@ class TickerData:
     r_cc: pd.Series   # close->close daily log returns (aligned to df dates)
     r_oc: pd.Series   # overnight gap log returns (open / prev close)
     r_co: pd.Series   # intraday move log returns (close / open)
+    r_pc: float | None = None  # live premarket simple return vs raw prev close; None if unavailable
 
 def _csv_path(symbol: str) -> Path:
     return Path(PRICES_DIR) / f"{symbol.upper()}.csv"
@@ -61,7 +62,22 @@ def _load_one(symbol: str) -> TickerData:
     # intraday: close vs open (same day)
     r_co = np.log(c / o)
 
-    return TickerData(symbol=symbol.upper(), df=df, r_cc=r_cc, r_oc=r_oc, r_co=r_co)
+    r_pc: float | None = None
+    try:
+        today = date.today()
+        last_csv_date = df["date"].iloc[-1].date()
+        if today.weekday() < 5 and today > last_csv_date:
+            from src.prices.schwab_client import fetch_premarket_price
+            p_pre = fetch_premarket_price(symbol)
+            if p_pre is not None:
+                prev_close = float(df["close"].iloc[-1])
+                if prev_close > 0:
+                    r_pc = (p_pre - prev_close) / prev_close
+    except Exception as exc:
+        print(f"[schwab] r_pc failed for {symbol}: {exc}")
+        r_pc = None
+
+    return TickerData(symbol=symbol.upper(), df=df, r_cc=r_cc, r_oc=r_oc, r_co=r_co, r_pc=r_pc)
 
 def _ewma_sigma_daily(r: pd.Series, lam: float = LAM) -> float | np.nan:
     if r.dropna().empty:
@@ -148,10 +164,24 @@ def _summarize_one(td: TickerData, spy_ewma_sigma: float, today: date) -> Dict[s
     ratio_ewma_vs_21 = ewma_sigma / sigma_21 if (sigma_21 and sigma_21 > 0) else np.nan
     ratio_ewma_vs_spy = ewma_sigma / spy_ewma_sigma if (spy_ewma_sigma and spy_ewma_sigma > 0) else np.nan
 
-    # last daily move z
-    ret_d = float(td.r_cc.dropna().iloc[-1]) if td.r_cc.dropna().size else np.nan
-    z_last_21 = _z_last(td.r_cc, BASELINE_W)
+    # last daily move z — prefer live premarket return if available
+    ret_d = (
+        td.r_pc
+        if td.r_pc is not None
+        else (float(td.r_cc.dropna().iloc[-1]) if td.r_cc.dropna().size else np.nan)
+    )
     r_last = ret_d
+
+    if td.r_pc is not None:
+        _r = td.r_cc.dropna()
+        if len(_r) >= BASELINE_W + 1:
+            _baseline = _r.iloc[-(BASELINE_W + 1):-1]
+            _mu, _sd = float(_baseline.mean()), float(_baseline.std(ddof=1))
+            z_last_21 = float((td.r_pc - _mu) / _sd) if (_sd > 0 and not np.isnan(_sd)) else np.nan
+        else:
+            z_last_21 = np.nan
+    else:
+        z_last_21 = _z_last(td.r_cc, BASELINE_W)
 
     # gap choice + z
     mode, gap_ret, gap_z_21 = _gap_choice_and_z(td, today=today)
@@ -187,7 +217,11 @@ def _summarize_one(td: TickerData, spy_ewma_sigma: float, today: date) -> Dict[s
 
 def _summarize_macro_one(td: TickerData, today: date) -> Dict[str, float | str]:
     asof = td.df["date"].iloc[-1].date() if not td.df.empty else None
-    ret_d = float(td.r_cc.dropna().iloc[-1]) if td.r_cc.dropna().size else np.nan
+    ret_d = (
+        td.r_pc
+        if td.r_pc is not None
+        else (float(td.r_cc.dropna().iloc[-1]) if td.r_cc.dropna().size else np.nan)
+    )
     return dict(
         symbol=td.symbol,
         asof=str(asof) if asof else None,

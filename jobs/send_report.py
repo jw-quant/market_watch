@@ -56,7 +56,7 @@ def main():
 
     from src.utility.emailer import send_report
     payload = {
-        "subject": args.subject or f"Premarket Report — {today}",
+        "subject": args.subject or f"Premarket Report from Jason — {today}",
         "body": f"Premarket report for {today}. See attached PDF.",
         "attachments": [str(pdf_path)],
     }
