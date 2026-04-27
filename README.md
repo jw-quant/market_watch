@@ -179,6 +179,9 @@ python jobs/premarket.py
 
 [View Sample File](./report_20260416_121505.html)
 
+<img width="807" height="582" alt="image" src="https://github.com/user-attachments/assets/e547bcdf-5042-4159-8af0-871a149ba6d1" />
+
+
 ---
 
 ## Notes
