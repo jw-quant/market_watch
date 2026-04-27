@@ -177,7 +177,7 @@ python jobs/premarket.py
 
 ## Sample Output
 
-*(A sample PDF report will be attached to the GitHub repository.)*
+[View Sample File](./report_20260416_121505.html)
 
 ---
 
