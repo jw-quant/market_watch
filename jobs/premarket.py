@@ -602,4 +602,7 @@ def main(market_date=None):
 
 
 if __name__ == "__main__":
-    main()
+    # from datetime import date as pydate
+    # d=pydate(2026,4,28)
+    d=None
+    main(d)

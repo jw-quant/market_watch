@@ -117,3 +117,38 @@ def fetch_premarket_price(symbol: str) -> Optional[float]:
     except Exception as exc:
         print(f"[schwab] price fetch failed ({symbol}): {exc}")
         return None
+
+
+# ---------- Trader API ----------
+
+_TRADER_BASE = "https://api.schwabapi.com/trader/v1"
+
+
+def fetch_accounts() -> list[dict]:
+    """GET /trader/v1/accounts — all linked accounts with accountNumber and hashValue."""
+    token = get_access_token()
+    with httpx.Client(timeout=15) as client:
+        resp = client.get(
+            f"{_TRADER_BASE}/accounts",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_transactions(account_hash: str, start_date: str, end_date: str) -> list[dict]:
+    """GET /trader/v1/accounts/{accountHash}/transactions filtered to TRADE type."""
+    token = get_access_token()
+    with httpx.Client(timeout=15) as client:
+        resp = client.get(
+            f"{_TRADER_BASE}/accounts/{account_hash}/transactions",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "startDate": f"{start_date}T00:00:00Z",
+                "endDate":   f"{end_date}T23:59:59Z",
+                "types":     "TRADE",
+            },
+        )
+        resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, list) else []
