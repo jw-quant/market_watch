@@ -19,10 +19,33 @@ import json
 from pathlib import Path
 import os
 
-ROOT_DIR = Path(__file__).resolve().parents[2]  # repo root
-DATA_DIR = str(ROOT_DIR / "data")
+ROOT_DIR = Path(__file__).resolve().parents[2]  # market_watch/ repo root
+DATA_DIR = str(ROOT_DIR / "data")               # project-specific data
 
-TICKERS_CONFIG_PATH = ROOT_DIR / "data" / "config" / "tickers.json"
+
+def _ensure_env() -> None:
+    """Load .env from repo root if DATA_ROOT not already set."""
+    if os.getenv("DATA_ROOT"):
+        return
+    env_path = ROOT_DIR / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_ensure_env()
+
+# Shared data root — repos/data/ when DATA_ROOT set, else market_watch/data/
+_shared_root = Path(os.getenv("DATA_ROOT", str(ROOT_DIR)))
+_SHARED_DATA = _shared_root / "data"
+
+TICKERS_CONFIG_PATH = _SHARED_DATA / "config" / "tickers.json"
 
 
 def _load_tickers_config() -> dict:
@@ -67,10 +90,12 @@ def get_sectors() -> list:
 # How far back to pull (in calendar days). Using 370 to comfortably cover ~252 trading days.
 LOOKBACK_DAYS = 370
 
-# Where Excel files go
 # ---- Data directories (single source of truth) ----
-PRICES_DIR          = f"{DATA_DIR}/prices"
-OPTIONS_DIR         = f"{DATA_DIR}/options"
+# Shared — follow DATA_ROOT (repos/data/)
+PRICES_DIR          = str(_SHARED_DATA / "prices")
+OPTIONS_DIR         = str(_SHARED_DATA / "options")
+
+# Project-specific — always market_watch/data/
 NEWS_DIR            = f"{DATA_DIR}/news"
 REDDIT_DIR          = f"{DATA_DIR}/reddit"
 REPORTS_DIR         = f"{DATA_DIR}/reports"

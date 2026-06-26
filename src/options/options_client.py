@@ -418,30 +418,45 @@ def fetch_range_atm_iv(ticker: str, start: str, end: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     out_rows = []
+    multi_day = len(filtered) > 1
+
     for row in filtered.itertuples(index=False):
         d = row.date.date()
         S = float(row.spot_close)
 
-        try:
-            contracts = _fetch_atm_contracts(t, asof=d, spot=S)
-        except Exception as e:
-            print(f"[contracts-error] {t} on {d}: {e}")
-            continue
+        for attempt in range(1, 3):
+            try:
+                contracts = _fetch_atm_contracts(t, asof=d, spot=S)
+            except Exception as e:
+                print(f"[contracts-error] {t} {d} attempt {attempt}/2: {e}")
+                if attempt < 2:
+                    print("[options] waiting 60s before retry...")
+                    time.sleep(60)
+                continue
 
-        if contracts.empty:
-            continue
+            if contracts.empty:
+                break  # empty contracts won't improve on retry
 
-        cm = _constant_maturity_atm_iv(t, asof=d, spot=S, contracts_df=contracts)
-        if cm is None:
-            continue
+            cm = _constant_maturity_atm_iv(t, asof=d, spot=S, contracts_df=contracts)
+            if cm is None:
+                print(f"[options] IV None for {t} {d} attempt {attempt}/2")
+                if attempt < 2:
+                    print("[options] waiting 60s before retry...")
+                    time.sleep(60)
+                continue
 
-        iv_val, trace = cm
-        out_rows.append({
-            "date": d.isoformat(),
-            "ticker": t,
-            "iv_cm_30d": iv_val,
-            **trace,
-        })
+            iv_val, trace = cm
+            out_rows.append({
+                "date": d.isoformat(),
+                "ticker": t,
+                "iv_cm_30d": iv_val,
+                **trace,
+            })
+            break  # success
+
+        if multi_day:
+            print(f"[options] per-day pause 60s after {t} {d}")
+            time.sleep(60)
 
     return pd.DataFrame(out_rows)
 

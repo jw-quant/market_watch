@@ -20,6 +20,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.common.env import load_env
+load_env()  # must run before constant.py is imported (it reads env vars at import time)
+
 from src.utility.constant import MORNING_REPORT_DIR
 
 
@@ -36,7 +38,6 @@ def main():
                         help="Email subject override")
     args = parser.parse_args()
 
-    load_env()
     today = date.today().isoformat()
 
     if args.pdf:

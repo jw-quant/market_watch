@@ -14,6 +14,8 @@ import traceback
 from typing import List, Optional, Tuple
 
 from src.common.env import load_env
+load_env()  # must run before constant.py is imported (it reads env vars at import time)
+
 from src.utility.paths import get_img_dir, get_txt_dir
 from src.utility.constant import SECTOR_TICKER_NAME_MAP
 
@@ -229,6 +231,24 @@ def pipeline_options(textlist: List[str], jpblist: List[str], market_date, ticke
     _append_text(textlist, p)
 
     return OptionsResult(summary_df=summary_df, iv_spike=iv_spike)
+
+
+def pipeline_liquidity(textlist: List[str], market_date) -> None:
+    """
+    Fetches FRED macro liquidity series and processes them into a compact text artifact.
+    Appends artifact path to textlist.
+    """
+    from src.macro.liquidity import main as liquidity_fetch
+    from src.macro.liquidity_process import main as liquidity_process
+
+    print("\n=== [Liquidity] Fetching FRED data ===")
+    liquidity_fetch(as_of=market_date)
+
+    print("\n=== [Liquidity] Processing liquidity summary ===")
+    txt_path = liquidity_process(as_of=market_date)
+
+    if txt_path and txt_path.exists():
+        _append_text(textlist, txt_path)
 
 
 def pipeline_reddit_wisdom(textlist: List[str]) -> None:
@@ -514,7 +534,6 @@ def temporary_send(textlist: List[str], jpblist: List[str], send_email: bool = T
 # ---------------------------
 
 def main(market_date=None):
-    load_env()
     from src.utility.date import last_market_date
 
     market_date = market_date or last_market_date()
@@ -552,7 +571,14 @@ def main(market_date=None):
     # #     time.sleep(10)
     # # print("  ...resuming")
 
-    # 3) Options pipeline (IV + iv-spike flags)
+    # 3) Liquidity pipeline (FRED macro inputs)
+    try:
+        pipeline_liquidity(textlist, market_date=market_date)
+    except Exception:
+        print("\n[ERROR] Liquidity pipeline failed.")
+        traceback.print_exc()
+
+    # 4) Options pipeline (IV + iv-spike flags)
     # Comment this block out if you want to skip options.
     try:
         options = pipeline_options(textlist, jpblist, market_date=market_date, tickers=sectors)
@@ -560,7 +586,7 @@ def main(market_date=None):
         print("\n[ERROR] Options pipeline failed.")
         traceback.print_exc()
 
-    # 4) News pipeline (GDELT fetch + top-20 clusters)
+    # 5) News pipeline (GDELT fetch + top-20 clusters)
     # Comment this block out if you want to skip news.
     # try:
     #     pipeline_news(textlist)
