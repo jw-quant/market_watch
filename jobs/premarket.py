@@ -188,7 +188,7 @@ def pipeline_options(textlist: List[str], jpblist: List[str], market_date, ticke
     Appends a compact text artifact to textlist.
     Pass tickers explicitly after the Reddit step has updated tickers.json.
     """
-    from src.options.options_client import update_atm_iv_series
+    from src.options.client import update_atm_iv_series
     from src.options.options_process import generate_options_report
 
     print("\n=== [Options] Updating IV series ===")

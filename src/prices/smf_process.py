@@ -67,7 +67,7 @@ def _load_one(symbol: str) -> TickerData:
         today = date.today()
         last_csv_date = df["date"].iloc[-1].date()
         if today.weekday() < 5 and today > last_csv_date:
-            from src.prices.schwab_client import fetch_premarket_price
+            from src.schwab.client import fetch_premarket_price
             p_pre = fetch_premarket_price(symbol)
             if p_pre is not None:
                 prev_close = float(df["close"].iloc[-1])

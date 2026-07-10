@@ -1,4 +1,7 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:system",
-    "claudeCodeChat.permissions.yoloMode": false
+    "claudeCodeChat.permissions.yoloMode": false,
+    "python.analysis.extraPaths": [
+        "../src-core"
+    ]
 }

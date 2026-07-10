@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(mkdir -p \"C:/Users/senio/.claude/projects/c--Users-senio-OneDrive-Desktop-repos-market-watch/memory\")",
+      "PowerShell(pip install -e \"C:\\\\Users\\\\senio\\\\OneDrive\\\\Desktop\\\\repos\\\\src-core\" 2>&1)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\senio\\.claude\\projects\\c--Users-senio-OneDrive-Desktop-repos-market-watch\\memory"
     ]
   }
 }
