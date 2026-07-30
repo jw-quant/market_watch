@@ -275,13 +275,11 @@ def save_state(state_df: pd.DataFrame) -> None:
 
 def save_tickers_json(config: dict, hot: list[str], candidates: list[str]) -> None:
     benchmark = _to_upper_list(config.get("benchmark", ["SPY"]))
-    sector = _to_upper_list(config.get("sector", []))
     core = _to_upper_list(config.get("core", config.get("static", [])))
     blocked = _to_upper_list(config.get("blocked", []))
 
     out = {
         "benchmark": benchmark,
-        "sector": sector,
         "core": core,
         "hot": hot,
         "candidates": candidates,

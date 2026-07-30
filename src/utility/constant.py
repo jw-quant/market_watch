@@ -81,10 +81,8 @@ def get_smf_tickers() -> list:
     return list(dict.fromkeys(benchmark + sector + core +hot ))
 
 def get_sectors() -> list:
-    """Re-read tickers.json from disk and return the current full universe."""
-    config = _load_tickers_config()
-    sector = config.get("sector", [])
-    return list(dict.fromkeys(sector))
+    """Return sector ETFs from the single source of truth: SECTOR_TICKER_NAME_MAP."""
+    return list(SECTOR_TICKER_NAME_MAP.keys())
 
 
 # How far back to pull (in calendar days). Using 370 to comfortably cover ~252 trading days.
