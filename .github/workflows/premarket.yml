@@ -64,6 +64,19 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python jobs/premarket.py
 
+      - name: Rotate Schwab refresh token in GitHub Secret
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          NEW_TOKEN=$(grep -oP '(?<=SCHWAB_REFRESH_TOKEN=).*' repos/market_watch/.env 2>/dev/null || true)
+          if [ -n "$NEW_TOKEN" ] && [ "$NEW_TOKEN" != "${{ secrets.SCHWAB_REFRESH_TOKEN }}" ]; then
+            echo "Rotating Schwab refresh token in GitHub Secrets..."
+            echo "$NEW_TOKEN" | gh secret set SCHWAB_REFRESH_TOKEN --repo jw-quant/market_watch
+          else
+            echo "Schwab refresh token unchanged or .env not written — skipping rotation."
+          fi
+
       - name: Sync data back to OneDrive
         if: always()
         run: |
