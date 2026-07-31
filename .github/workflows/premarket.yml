@@ -1,0 +1,79 @@
+name: Daily Premarket
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5'   # 9 AM EDT (UTC-4). Change to 14 in winter (EST).
+  workflow_dispatch:
+
+jobs:
+  premarket:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout market_watch
+        uses: actions/checkout@v4
+        with:
+          path: repos/market_watch
+
+      - name: Checkout src-core
+        uses: actions/checkout@v4
+        with:
+          repository: jw-quant/src_core
+          token: ${{ secrets.GH_PAT }}
+          path: repos/src-core
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: repos/market_watch/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -e repos/src-core
+          pip install -r repos/market_watch/requirements.txt
+
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+
+      - name: Download data from OneDrive
+        run: |
+          mkdir -p repos/data
+          rclone copy "onedrive:Desktop/repos/data" repos/data --transfers=8 -v
+
+      - name: Run premarket.py
+        working-directory: repos/market_watch
+        env:
+          DATA_ROOT: ${{ github.workspace }}/repos
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          SCHWAB_CLIENT_ID: ${{ secrets.SCHWAB_CLIENT_ID }}
+          SCHWAB_CLIENT_SECRET: ${{ secrets.SCHWAB_CLIENT_SECRET }}
+          SCHWAB_REFRESH_TOKEN: ${{ secrets.SCHWAB_REFRESH_TOKEN }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          SMF_SMTP_USER: ${{ secrets.SMF_SMTP_USER }}
+          SMF_SMTP_PASS: ${{ secrets.SMF_SMTP_PASS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python jobs/premarket.py
+
+      - name: Sync data back to OneDrive
+        if: always()
+        run: |
+          rclone copy repos/data "onedrive:Desktop/repos/data" --transfers=8 -v
+          rclone copy "repos/market_watch/data/reports" "onedrive:Desktop/repos/market_watch/data/reports" --transfers=8 -v
+
+      - name: Upload reports as run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: premarket-run-${{ github.run_number }}
+          path: repos/market_watch/data/reports/
+          retention-days: 14
