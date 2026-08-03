@@ -1,77 +1,15 @@
 name: Daily Premarket
 
+# Triggered by cron-job.org at exactly 6:45 AM America/New_York via workflow_dispatch.
+# The GitHub internal schedule below is a fallback only — it may fire late due to
+# GitHub's shared runner queue. Remove it once cron-job.org is confirmed working.
 on:
   schedule:
-    - cron: '45 10 * * 1-5'  # 6:45 AM EDT (UTC-4, Mar–Nov)
-    - cron: '45 11 * * 1-5'  # 6:45 AM EST (UTC-5, Nov–Mar)
+    - cron: '45 11 * * 1-5'  # fallback: 6:45 AM EST / 7:45 AM EDT — imprecise, see above
   workflow_dispatch:
 
 jobs:
-  # Gate job: allow 5–11 AM NYC (covers cron + up to 5h GitHub delay),
-  # then block if a scheduled run already succeeded today (prevents double-fire
-  # from two crons). workflow_dispatch always bypasses both checks.
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.check.outputs.run }}
-    steps:
-      - name: NYC time gate + duplicate guard
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual dispatch — always proceeding."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          nyc_hour=$(TZ=America/New_York date +%-H)
-          nyc_today=$(TZ=America/New_York date +%Y-%m-%d)
-          echo "NYC: ${nyc_today} hour=${nyc_hour}"
-
-          # Allow 5 AM–11 AM NYC. Covers 6:45 AM target + up to 5h GitHub delay.
-          # Outside this window means a cron from a completely different day leaked through.
-          if [ "$nyc_hour" -lt 5 ] || [ "$nyc_hour" -gt 11 ]; then
-            echo "Outside 5–11 AM NYC window (hour=${nyc_hour}) — skipping."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Block if another scheduled run already succeeded today (prevents double-run).
-          gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --event schedule \
-            --status success \
-            --limit 10 \
-            --json databaseId,createdAt > /tmp/runs.json
-
-          prior=$(python3 -c "
-import json, os
-from datetime import datetime
-from zoneinfo import ZoneInfo
-runs = json.load(open('/tmp/runs.json'))
-nyc = ZoneInfo('America/New_York')
-today = datetime.now(nyc).strftime('%Y-%m-%d')
-current = os.environ.get('GITHUB_RUN_ID', '')
-prior = [r for r in runs
-         if datetime.fromisoformat(r['createdAt'].replace('Z', '+00:00'))
-              .astimezone(nyc).strftime('%Y-%m-%d') == today
-         and str(r['databaseId']) != current]
-print(len(prior))
-")
-
-          if [ "$prior" -gt "0" ]; then
-            echo "Scheduled run already completed today — skipping duplicate."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "First scheduled run today, within window — proceeding."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
   premarket:
-    needs: gate
-    if: needs.gate.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
